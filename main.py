@@ -3,7 +3,6 @@ import io
 import cv2
 import numpy as np
 import streamlit as st
-import tifffile
 from PIL import Image
 
 st.set_page_config(page_title="PAI TP", page_icon=":robot_face:", layout="wide")
@@ -74,22 +73,79 @@ if page == "Visualizar imagem":
 
 elif page == "Carregar dataset":
     st.header("Carregar dataset")
-    st.info("WIP")
+
+    diretory = st.text_input("Caminho do diretório raiz", placeholder="/dados/rmlo/")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        mammary = st.selectbox("Mama", ["right", "left"])
+    with col2:
+        orientation = st.selectbox("Orientação", ["CC", "MLO"])
+
+    PREFIX = {"D": "BIRADS I", "E": "BIRADS II", "F": "BIRADS III", "G": "BIRADS IV"}
+
+    if st.button("Carregar diretório"):
+        import glob
+        import os
+
+        files = glob.glob(os.path.join(diretory, "**", "*.png"), recursive=True)
+
+        test, train = [], []
+        for path in files:
+            filename = os.path.basename(path)
+            prefix = filename[0].upper()
+
+            if prefix not in PREFIX:
+                st.warning(f"Arquivo ignorado (prefixo desconhecido): {filename}")
+                continue
+
+            digits = "".join(filter(str.isdigit, filename))
+            number = int(digits) if digits else 0
+
+            entry = {
+                "path": path,
+                "class": PREFIX[prefix],
+                "name": filename,
+            }
+
+            if number % 4 == 0:
+                test.append(entry)
+            else:
+                train.append(entry)
+
+        st.session_state["dataset"] = {"train": train, "test": test}
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Imagens de treino", len(train))
+        col2.metric("Imagens de teste (múlt. 4)", len(test))
+        col3.metric("Total", len(train) + len(test))
+
+        import pandas as pd
+
+        df = pd.DataFrame(train + test)
+        df["split"] = ["treino"] * len(train) + ["teste"] * len(test)
+        st.dataframe(df[["name", "class", "split"]], use_container_width=True)
+
 elif page == "Segmentação":
     st.header("Segmentação")
     st.info("WIP")
+
 elif page == "Aumento de dados":
     st.header("Aumento de dados")
     st.info("WIP")
+
 elif page == "Treinar modelo":
     st.header("Treinar modelo")
     st.info("WIP")
+
 elif page == "Classificação binária":
     st.header("Classificação binária")
     st.info("WIP")
+
 elif page == "Classificação 4 classes":
     st.header("Classificação 4 classes")
     st.info("WIP")
+
 elif page == "Grad-CAM":
     st.header("Grad-CAM")
     st.info("WIP")
