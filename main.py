@@ -3,6 +3,7 @@ import io
 import cv2
 import numpy as np
 import streamlit as st
+from pandas.core.col import col
 from PIL import Image
 
 st.set_page_config(page_title="PAI TP", page_icon=":robot_face:", layout="wide")
@@ -128,11 +129,91 @@ elif page == "Carregar dataset":
 
 elif page == "Segmentação":
     st.header("Segmentação")
-    st.info("WIP")
+
+    if "image_arr" not in st.session_state:
+        st.warning("Abra uma imagem primeiro na aba 'Visualizar imagem'.")
+        st.stop()
+
+    arr = st.session_state["image_arr"]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        threshold = st.slider("Threshold", 0, 500, 20)
+    with col2:
+        kernel_size = st.selectbox("Kernel morfológico", [5, 7, 11, 15])
+
+    def segment_image(arr, threshold, kernel_size):
+        img = arr.copy()
+
+        _, mask = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY)
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+        if n_labels > 1:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask = (labels == largest_label).astype(np.uint8) * 255
+
+        segmented = cv2.bitwise_and(img, img, mask=mask)
+        return mask, segmented
+
+    mask, segmented = segment_image(arr, threshold, kernel_size)
+
+    col1, col2, col3 = st.columns(3)
+    col1.image(arr, caption="Original", clamp=True, width="content")
+    col2.image(mask, caption="Máscara", clamp=True, width="content")
+    col3.image(segmented, caption="Segmentada", clamp=True, width="content")
+
+    if st.button("Aplicar ao dataset inteiro"):
+        st.session_state["segmentation_params"] = {
+            "threshold": threshold,
+            "kernel_size": kernel_size,
+        }
+        st.success(
+            "Parâmetros salvos. O dataset será processado durante o treinamento."
+        )
+
+    st.session_state["segmented_arr"] = segmented
 
 elif page == "Aumento de dados":
     st.header("Aumento de dados")
-    st.info("WIP")
+    st.caption("Rotações de −20° a +20° em intervalos de 10° — 5 variações por imagem")
+
+    if "segmented_arr" not in st.session_state:
+        st.warning("Segmente uma imagem primeiro.")
+        st.stop()
+
+    arr = st.session_state["segmented_arr"]
+
+    def rotate(arr, angle):
+        img = arr.copy()
+        h, w = img.shape[:2]
+        center = (w / 2, h / 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+        return rotated
+
+    angles = [-20, -10, 0, 10, 20]
+    cols = st.columns(len(angles))
+    for col, angle in zip(cols, angles):
+        rotated = rotate(arr, angle)
+        col.image(rotated, caption=f"{angle:+d}°", clamp=True, width="content")
+
+    if st.button("Gerar aumentos para todo o dataset de treino"):
+        if "dataset" not in st.session_state:
+            st.error("Carregue o dataset primeiro.")
+        else:
+            st.info(
+                f"Serão geradas {len(st.session_state['dataset']['train']) * 5} imagens no total."
+            )
+            st.session_state["use_augmentation"] = True
+            st.success(
+                "Configurado. O aumento será aplicado durante o carregamento para treino."
+            )
 
 elif page == "Treinar modelo":
     st.header("Treinar modelo")
