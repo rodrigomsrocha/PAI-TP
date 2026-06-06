@@ -12,7 +12,6 @@ from pandas.core.col import col
 from PIL import Image
 from sklearn.metrics import (
     accuracy_score,
-    classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -286,6 +285,77 @@ class MammoDataset(Dataset):
         label = self.class_id[sample["class"]]
 
         return tensor, label
+
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.activations = {}
+        self.gradients = {}
+
+        for param in target_layer.parameters():
+            param.requires_grad = True
+
+        target_layer.register_forward_hook(
+            lambda module, input, output: self.activations.update({"feat": output})
+        )
+
+    def generate(self, tensor, class_id=None):
+        self.model.eval()
+        tensor = tensor.unsqueeze(0)
+
+        output = self.model(tensor)
+        if isinstance(output, tuple):
+            output = output[0]
+
+        id = class_id if class_id is not None else output.argmax(dim=1).item()
+        prob = torch.nn.functional.softmax(output, dim=1)[0, id].item()
+
+        self.model.zero_grad()
+        output[0, id].backward(retain_graph=True)
+
+        gradients = torch.autograd.grad(
+            outputs=output[0, id],
+            inputs=self.activations["feat"],
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+
+        if gradients is None:
+            st.error("Gradiente não calculado — verifique a camada alvo.")
+            return None, id, prob
+
+        weights = gradients.mean(dim=[2, 3], keepdim=True)
+
+        cam = (weights * self.activations["feat"]).sum(dim=1, keepdim=True)
+        cam = torch.nn.functional.relu(cam)
+
+        cam = cam.squeeze().cpu().detach().numpy()
+        min_cam, max_cam = cam.min(), cam.max()
+        if max_cam > min_cam:
+            cam = (cam - min_cam) / (max_cam - min_cam)
+        else:
+            cam = np.zeros_like(cam)
+
+        return cam, id, prob
+
+
+def get_target_layer(model, network_name):
+    if network_name == "densenet":
+        return model.features.denseblock4.denselayer16.conv2
+    elif network_name == "inception":
+        return model.Mixed_7c.branch_pool.conv
+
+
+def apply_gradcam(normalized_cam, uint8_img, size):
+    cam_resized = cv2.resize(normalized_cam, (size, size))
+    heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    rgb_img = np.stack([uint8_img] * 3, axis=-1)
+
+    overlay = cv2.addWeighted(rgb_img, 0.5, heatmap_rgb, 0.5, 0)
+    return heatmap_rgb, overlay
 
 
 st.set_page_config(page_title="PAI TP", page_icon=":robot_face:", layout="wide")
@@ -704,4 +774,93 @@ elif page == "Classificação 4 classes":
 
 elif page == "Grad-CAM":
     st.header("Grad-CAM")
-    st.info("WIP")
+    st.caption("Regiões que influenciaram a decisão da rede")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        network_name = st.selectbox("Rede", ["densenet", "inception"])
+    with col2:
+        task = st.selectbox(
+            "Tarefa",
+            [("Binária", 2), ("4 classes", 4)],
+            format_func=lambda x: x[0],
+        )
+        classes_num = task[1]
+
+    key = f"{network_name}_nc{classes_num}"
+    if f"model_{key}" not in st.session_state:
+        st.warning("Treine ou carregue os pesos para essa tarefa primeiro.")
+        st.stop()
+
+    file = st.file_uploader(
+        "Selecionar imagem para análise", type=["png", "tif", "tiff"]
+    )
+
+    NAMES_4_CLASSES = ["BIRADS I", "BIRADS II", "BIRADS III", "BIRADS IV"]
+    NAMES_BINARY = ["Benigno (I+II)", "Maligno (III+IV)"]
+
+    if file and st.button("Gerar Grad-CAM"):
+        model = st.session_state[f"model_{key}"]
+        device = torch.device("cuda")
+        img_size = 299 if network_name == "inception" else 224
+
+        raw = file.read()
+        arr = np.array(Image.open(io.BytesIO(raw)).convert("L"))
+
+        params = st.session_state.get(
+            "segmentation_params", {"threshold": 18, "kernel_size": 7}
+        )
+        _, segmented_arr = segment_image(
+            arr, params["threshold"], params["kernel_size"]
+        )
+
+        lo, hi = segmented_arr.min(), segmented_arr.max()
+        if hi > lo:
+            arr_8 = ((segmented_arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(
+                np.uint8
+            )
+        else:
+            arr_8 = np.zeros_like(segmented_arr, dtype=np.uint8)
+
+        resized_arr = cv2.resize(arr_8, (img_size, img_size))
+        arr_rgb = np.stack([resized_arr] * 3, axis=-1)
+
+        tensor = torch.from_numpy(resized_arr).to(device)
+        tensor = tensor.unsqueeze(0).repeat(3, 1, 1)
+
+        if tensor.dtype == torch.uint8:
+            tensor = tensor.to(torch.float32) / 255.0
+        elif tensor.dtype != torch.float32:
+            tensor = tensor.to(torch.float32)
+
+        normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        tensor = normalize(tensor)
+
+        layer = get_target_layer(model, network_name)
+        gradcam = GradCAM(model, layer)
+        cam, pred_id, prob = gradcam.generate(tensor, class_id=None)
+        heatmap, overlay = apply_gradcam(cam, resized_arr, img_size)
+
+        col1, col2, col3 = st.columns(3)
+        col1.image(resized_arr, caption="Segmentada", clamp=True, width="content")
+        col2.image(heatmap, caption="Mapa de calor", clamp=True, width="content")
+        col3.image(overlay, caption="Sobreposição", clamp=True, width="content")
+
+        names = NAMES_BINARY if classes_num == 2 else NAMES_4_CLASSES
+        st.divider()
+        st.subheader("Resultado da classificação")
+
+        col4, col5 = st.columns(2)
+        col4.metric("Classe predita", names[pred_id])
+        col5.metric("Confiança", f"{prob:.2%}")
+
+        with torch.no_grad():
+            output = model(tensor.unsqueeze(0))
+            if isinstance(output, tuple):
+                output = output[0]
+            probs = torch.nn.functional.softmax(output, dim=1)[0].cpu().tolist()
+
+        st.caption("Probabilidade por classe:")
+
+        for name, p in zip(names, probs):
+            st.progress(p, text=f"{name}: {p:.2%}")
