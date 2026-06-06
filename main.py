@@ -10,6 +10,13 @@ import torchvision.models as models
 import torchvision.transforms as T
 from pandas.core.col import col
 from PIL import Image
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+)
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -173,6 +180,41 @@ def train_model(
                 break
 
     return model, history
+
+
+def evalute_model(model, test_entries, classes_num, network_name):
+    device = torch.device("cuda")
+    img_size = 299 if network_name == "inception" else 224
+    model.eval()
+
+    test_dataset = MammoDataset(
+        test_entries,
+        use_augment=False,
+        classes_num=classes_num,
+        img_size=img_size,
+    )
+
+    loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=0)
+
+    all_labels = []
+    all_preds = []
+
+    t0 = time.time()
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs = imgs.to(device)
+
+            if network_name == "inception":
+                model.eval()
+
+            output = model(imgs)
+            preds = output.argmax(dim=1).cpu().tolist()
+            all_labels.extend(labels.tolist())
+            all_preds.extend(preds)
+
+    time_span = time.time() - t0
+
+    return all_labels, all_preds, time_span
 
 
 class MammoDataset(Dataset):
@@ -526,11 +568,139 @@ elif page == "Treinar modelo":
 
 elif page == "Classificação binária":
     st.header("Classificação binária")
-    st.info("WIP")
+    st.caption("Benigno (BIRADS I+II) vs Maligno (BIRADS III+IV)")
+
+    if "test" not in st.session_state["dataset"]:
+        st.warning("Carregue o dataset primeiro.")
+        st.stop()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        network_name = st.selectbox("Rede", ["densenet", "inception"])
+
+    key = f"{network_name}_nc2"
+    is_model_available = f"model_{key}" in st.session_state
+
+    if not is_model_available:
+        st.warning("Treine ou carregue os pesos para classificação binária primeiro.")
+        st.stop()
+
+    if st.button("Classificar conjunto de teste"):
+        modelo = st.session_state[f"model_{key}"]
+        labels, preds, time_span = evalute_model(
+            modelo, st.session_state["dataset"]["test"], 2, network_name
+        )
+
+        acc = accuracy_score(labels, preds)
+        prec = precision_score(labels, preds)
+        f1 = f1_score(labels, preds)
+
+        conf_matrix = confusion_matrix(labels, preds)
+        tn, fp, fn, tp = conf_matrix.ravel()
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+        st.metric("Tempoo", f"{time_span:.1f}s")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Sensibilidade", f"{sensitivity:.2%}")
+        col2.metric("Especificidade", f"{specificity:.2%}")
+        col3.metric("Precisão", f"{prec:.2%}")
+        col4.metric("Acurácia", f"{acc:.2%}")
+        col5.metric("F1-score", f"{f1:.4f}")
+
+        import pandas as pd
+
+        conf_matrix_df = pd.DataFrame(
+            conf_matrix,
+            index=["Real Benigno", "Real Maligno"],
+            columns=["Predito Benigno", "Predito Maligno"],
+        )
+        st.subheader("Matriz de confusão")
+        st.dataframe(conf_matrix_df)
+
+        st.session_state[f"{network_name}_bin_results"] = {
+            "sens": sensitivity,
+            "spec": specificity,
+            "prec": prec,
+            "acc": acc,
+            "f1": f1,
+            "time_s": time_span,
+            "conf_matrix": conf_matrix,
+        }
 
 elif page == "Classificação 4 classes":
     st.header("Classificação 4 classes")
-    st.info("WIP")
+    st.caption("BIRADS I vs II vs III vs IV")
+
+    if "test" not in st.session_state["dataset"]:
+        st.warning("Carregue o dataset primeiro.")
+        st.stop()
+
+    network_name = st.selectbox("Rede", ["densenet", "inception"])
+    key = f"{network_name}_nc4"
+    is_model_available = f"model_{key}" in st.session_state
+
+    if not is_model_available:
+        st.warning("Treine ou carregue os pesos para classificação 4 classes primeiro.")
+        st.stop()
+
+    if st.button("Classificar conjunto de teste"):
+        model = st.session_state[f"model_{key}"]
+        labels, preds, time_span = evalute_model(
+            model, st.session_state["dataset"]["test"], 4, network_name
+        )
+
+        classes_names = ["BIRADS I", "BIRADS II", "BIRADS III", "BIRADS IV"]
+        conf_matrix = confusion_matrix(labels, preds)
+        acc = accuracy_score(labels, preds)
+
+        sens_per_class, spec_per_class = [], []
+        for i in range(4):
+            tp = conf_matrix[i, i]
+            fn = conf_matrix[i, :].sum() - tp
+            fp = conf_matrix[:, i].sum() - tp
+            tn = conf_matrix.sum() - (tp + fn + fp)
+
+            sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+            sens_per_class.append(sens)
+            spec_per_class.append(spec)
+
+        avg_sens = sum(sens_per_class) / len(sens_per_class)
+        avg_spec = sum(spec_per_class) / len(spec_per_class)
+
+        st.metric("Tempoo", f"{time_span:.1f}s")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Sensibilidade média", f"{avg_sens:.2%}")
+        col2.metric("Especificidade média", f"{avg_spec:.2%}")
+        col3.metric("Acurácia", f"{acc:.2%}")
+
+        import pandas as pd
+
+        conf_matrix_df = pd.DataFrame(
+            conf_matrix, index=classes_names, columns=classes_names
+        )
+        st.subheader("Matriz de confusão")
+        st.dataframe(conf_matrix_df)
+
+        st.subheader("Sensibilidade por classe")
+        for name, sens in zip(classes_names, sens_per_class):
+            st.write(f"{name}: {sens:.2%}")
+
+        st.subheader("Especificidade por classe")
+        for name, spec in zip(classes_names, spec_per_class):
+            st.write(f"{name}: {spec:.2%}")
+
+        st.session_state[f"{network_name}_4c_results"] = {
+            "avg_sens": avg_sens,
+            "avg_spec": avg_spec,
+            "acc": acc,
+            "time_s": time_span,
+            "conf_matrix": conf_matrix,
+        }
 
 elif page == "Grad-CAM":
     st.header("Grad-CAM")
