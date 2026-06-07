@@ -1,3 +1,8 @@
+# Nome                             Matricula       Curso                   Campus
+# João Victor Martins dos Anjos    824604          Ciência da Computação   Lourdes
+# Rodrigo Rocha Marques
+# Rafael Coelho
+
 import io
 import time
 from typing import cast
