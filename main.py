@@ -19,10 +19,12 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset
 
 
-def segment_image(arr, threshold, kernel_size):
+def segment_image(arr, threshold=None, kernel_size=7):
     img = arr.copy()
 
-    _, mask = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY)
+    blurred = cv2.GaussianBlur(img, (5, 5), 0)
+
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -32,10 +34,11 @@ def segment_image(arr, threshold, kernel_size):
     if n_labels > 1:
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         mask = (labels == largest_label).astype(np.uint8) * 255
+    else:
+        mask = np.zeros_like(img)
 
     segmented = cv2.bitwise_and(img, img, mask=mask)
     return mask, segmented
-
 
 def rotate(arr, angle):
     img = arr.copy()
@@ -97,7 +100,7 @@ def train_model(
     epoch_callback=None,
 ):
     torch.cuda.empty_cache()
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     best_loss = float("inf")
     epochs_no_improve = 0
@@ -182,7 +185,7 @@ def train_model(
 
 
 def evalute_model(model, test_entries, classes_num, network_name):
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     img_size = 299 if network_name == "inception" else 224
     model.eval()
 
@@ -624,7 +627,7 @@ elif page == "Treinar modelo":
         weights_file = st.file_uploader("Arquivo .pth", type=["pth"])
 
     if st.button("Carregar") and weights_file:
-        device = torch.device("cuda")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model, _ = load_model(load_network, load_classes_num, device)
         state = torch.load(io.BytesIO(weights_file.read()), map_location=device)
         model.load_state_dict(state)
@@ -801,7 +804,7 @@ elif page == "Grad-CAM":
 
     if file and st.button("Gerar Grad-CAM"):
         model = st.session_state[f"model_{key}"]
-        device = torch.device("cuda")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         img_size = 299 if network_name == "inception" else 224
 
         raw = file.read()
