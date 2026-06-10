@@ -1,6 +1,6 @@
 # Nome                             Matricula       Curso                   Campus
 # João Victor Martins dos Anjos    824604          Ciência da Computação   Lourdes
-# Rodrigo Rocha Marques
+# Rodrigo Marques Rocha            826583          Ciência da Computação   Lourdes
 # Rafael Coelho                    769774          Ciência da Computação   Lourdes
 
 import io
