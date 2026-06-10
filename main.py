@@ -173,7 +173,6 @@ def train_model(
         optimizer, mode="min", factor=0.5, patience=5
     )
     
-    # MODIFICAÇÃO: Elevação do Label Smoothing de 0.05 para 0.1 para conter ganância por certeza absoluta
     criteria = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     history = []
@@ -294,7 +293,6 @@ class MammoDataset(Dataset):
             self.transform = T.Compose([
                 T.ToTensor(),
                 T.RandomHorizontalFlip(p=0.5),
-                # MODIFICAÇÃO: Ajuste de escala para (0.7, 0.9) para zoom mais agressivo no miolo do tecido
                 T.RandomResizedCrop(img_size, scale=(0.7, 0.9), antialias=True),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
