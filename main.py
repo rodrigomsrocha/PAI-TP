@@ -1,19 +1,17 @@
 # Nome                             Matricula       Curso                   Campus
 # João Victor Martins dos Anjos    824604          Ciência da Computação   Lourdes
 # Rodrigo Rocha Marques
-# Rafael Coelho
+# Rafael Coelho                    769774          Ciência da Computação   Lourdes
 
 import io
 import time
 from typing import cast
-
 import cv2
 import numpy as np
 import streamlit as st
 import torch
 import torchvision.models as models
 import torchvision.transforms as T
-from pandas.core.col import col
 from PIL import Image
 from sklearn.metrics import (
     accuracy_score,
@@ -24,7 +22,19 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset
 
 
-def segment_image(arr, threshold=None, kernel_size=7):
+def apply_clahe(arr, clip_limit=2.0, tile_size=(8, 8)):
+    if arr.dtype != np.uint8:
+        lo, hi = arr.min(), arr.max()
+        if hi > lo:
+            arr = ((arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(np.uint8)
+        else:
+            arr = np.zeros_like(arr, dtype=np.uint8)
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+    return clahe.apply(arr)
+
+
+def segment_and_crop_image(arr, kernel_size):
     img = arr.copy()
 
     blurred = cv2.GaussianBlur(img, (5, 5), 0)
@@ -39,11 +49,22 @@ def segment_image(arr, threshold=None, kernel_size=7):
     if n_labels > 1:
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         mask = (labels == largest_label).astype(np.uint8) * 255
-    else:
-        mask = np.zeros_like(img)
+
+    erosion_kernel = np.ones((15, 15), np.uint8)
+    mask = cv2.erode(mask, erosion_kernel, iterations=1)
 
     segmented = cv2.bitwise_and(img, img, mask=mask)
-    return mask, segmented
+
+    x, y, w, h = cv2.boundingRect(mask)
+    
+    if w < 50 or h < 50:
+        return mask, segmented
+        
+    cropped_mask = mask[y:y+h, x:x+w]
+    cropped_segmented = segmented[y:y+h, x:x+w]
+
+    return cropped_mask, cropped_segmented
+
 
 def rotate(arr, angle):
     img = arr.copy()
@@ -55,20 +76,23 @@ def rotate(arr, angle):
 
 
 def load_model(name: str, classes_num: int, device: torch.device):
-    """
-    name: 'densenet' or 'inception'
-    classes_num: 2 for binary classification, 4 for multi-class
-    device: 'cpu' or 'cuda'
-    """
-
     if name == "densenet":
         model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
 
         for param in model.parameters():
             param.requires_grad = False
 
+        for param in model.features.denseblock3.parameters():
+            param.requires_grad = True
+            
+        for param in model.features.denseblock4.parameters():
+            param.requires_grad = True
+
         feateures_num = model.classifier.in_features
-        model.classifier = torch.nn.Linear(feateures_num, classes_num)
+        model.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(p=0.5),
+            torch.nn.Linear(feateures_num, classes_num)
+        )
         img_size = 224
 
     elif name == "inception":
@@ -79,12 +103,23 @@ def load_model(name: str, classes_num: int, device: torch.device):
         for param in model.parameters():
             param.requires_grad = False
 
+        for param in model.Mixed_7b.parameters():
+            param.requires_grad = True
+        for param in model.Mixed_7c.parameters():
+            param.requires_grad = True
+
         if model.AuxLogits is not None:
             aux_features = cast(torch.nn.Linear, model.AuxLogits.fc)
-            model.AuxLogits.fc = torch.nn.Linear(aux_features.in_features, classes_num)
+            model.AuxLogits.fc = torch.nn.Sequential(
+                torch.nn.Dropout(p=0.5),
+                torch.nn.Linear(aux_features.in_features, classes_num)
+            )
 
         features_num = model.fc.in_features
-        model.fc = torch.nn.Linear(features_num, classes_num)
+        model.fc = torch.nn.Sequential(
+            torch.nn.Dropout(p=0.5),
+            torch.nn.Linear(features_num, classes_num)
+        )
         img_size = 299
 
     else:
@@ -120,18 +155,26 @@ def train_model(
         classes_num=classes_num,
         img_size=img_size,
     )
+    
     loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=2,      
+        pin_memory=True,    
+        prefetch_factor=2       
     )
 
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-4
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
     )
-    criteria = torch.nn.CrossEntropyLoss()
+    
+    # MODIFICAÇÃO: Elevação do Label Smoothing de 0.05 para 0.1 para conter ganância por certeza absoluta
+    criteria = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     history = []
 
@@ -226,12 +269,6 @@ def evalute_model(model, test_entries, classes_num, network_name):
 
 class MammoDataset(Dataset):
     def __init__(self, entries, use_augment=False, img_size=224, classes_num=4):
-        """
-        entries: dicts list with keys 'path' and 'class'
-                 generated by the dataset laoder
-        use_augment: if True, expands each image in 5 rotations
-        img_size: network entry size (224 for DenseNet and Inception)
-        """
         self.img_size = img_size
         if classes_num == 2:
             self.class_id = {
@@ -253,12 +290,20 @@ class MammoDataset(Dataset):
             {**entry, "angle": angle} for entry in entries for angle in angles
         ]
 
-        self.transform = T.Compose(
-            [
+        if use_augment:
+            self.transform = T.Compose([
                 T.ToTensor(),
+                T.RandomHorizontalFlip(p=0.5),
+                # MODIFICAÇÃO: Ajuste de escala para (0.7, 0.9) para zoom mais agressivo no miolo do tecido
+                T.RandomResizedCrop(img_size, scale=(0.7, 0.9), antialias=True),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ]
-        )
+            ])
+        else:
+            self.transform = T.Compose([
+                T.ToTensor(),
+                T.Resize((img_size, img_size), antialias=True),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
 
     def __len__(self):
         return len(self.samples)
@@ -269,9 +314,12 @@ class MammoDataset(Dataset):
         arr = np.array(Image.open(sample["path"]).convert("L"))
 
         params = st.session_state.get(
-            "segmentation_params", {"threshold": 18, "kernel_size": 7}
+            "segmentation_params", {"clip_limit": 2.0, "kernel_size": 7}
         )
-        _, arr = segment_image(arr, params["threshold"], params["kernel_size"])
+        
+        arr = apply_clahe(arr, clip_limit=params.get("clip_limit", 2.0))
+        
+        _, arr = segment_and_crop_image(arr, params["kernel_size"])
 
         if sample["angle"] != 0:
             arr = rotate(arr, sample["angle"])
@@ -282,18 +330,11 @@ class MammoDataset(Dataset):
         else:
             arr = np.zeros_like(arr, dtype=np.uint8)
 
-        arr = cv2.resize(
-            arr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR
-        )
-
         arr_rgb = np.stack([arr] * 3, axis=-1)
-
         tensor = self.transform(arr_rgb)
-
         label = self.class_id[sample["class"]]
 
         return tensor, label
-
 
 class GradCAM:
     def __init__(self, model, target_layer):
@@ -488,7 +529,7 @@ elif page == "Carregar dataset":
         st.dataframe(df[["name", "class", "split"]], use_container_width=True)
 
 elif page == "Segmentação":
-    st.header("Segmentação")
+    st.header("Segmentação Avançada")
 
     if "image_arr" not in st.session_state:
         st.warning("Abra uma imagem primeiro na aba 'Visualizar imagem'.")
@@ -498,34 +539,35 @@ elif page == "Segmentação":
 
     col1, col2 = st.columns(2)
     with col1:
-        threshold = st.slider("Threshold", 0, 500, 20)
+        clip_limit = st.slider("CLAHE Clip Limit (Contraste)", 0.1, 10.0, 2.0, step=0.1)
     with col2:
-        kernel_size = st.selectbox("Kernel morfológico", [5, 7, 11, 15])
+        kernel_size = st.selectbox("Kernel morfológico", [5, 7, 11, 15], index=1)
 
-    mask, segmented = segment_image(arr, threshold, kernel_size)
+    arr_clahe = apply_clahe(arr, clip_limit=clip_limit)
+    mask, cropped_segmented = segment_and_crop_image(arr_clahe, kernel_size)
 
     col1, col2, col3 = st.columns(3)
     col1.image(arr, caption="Original", clamp=True, width="content")
-    col2.image(mask, caption="Máscara", clamp=True, width="content")
-    col3.image(segmented, caption="Segmentada", clamp=True, width="content")
+    col2.image(mask, caption="Máscara (Otsu + Erosão + Crop)", clamp=True, width="content")
+    col3.image(cropped_segmented, caption="Realçada, Segmentada e Cortada", clamp=True, width="content")
 
     if st.button("Aplicar ao dataset inteiro"):
         st.session_state["segmentation_params"] = {
-            "threshold": threshold,
+            "clip_limit": clip_limit,
             "kernel_size": kernel_size,
         }
         st.success(
-            "Parâmetros salvos. O dataset será processado durante o treinamento."
+            "Parâmetros salvos! O novo pipeline (CLAHE + Otsu + Erosão + Crop) será executado dinamicamente no Dataset."
         )
 
-    st.session_state["segmented_arr"] = segmented
+    st.session_state["segmented_arr"] = cropped_segmented
 
 elif page == "Aumento de dados":
     st.header("Aumento de dados")
     st.caption("Rotações de −20° a +20° em intervalos de 10° — 5 variações por imagem")
 
     if "segmented_arr" not in st.session_state:
-        st.warning("Segmente uma imagem primeiro.")
+        st.warning("Acesse a aba 'Segmentação' primeiro para processar a imagem de exemplo.")
         st.stop()
 
     arr = st.session_state["segmented_arr"]
@@ -541,17 +583,17 @@ elif page == "Aumento de dados":
             st.error("Carregue o dataset primeiro.")
         else:
             st.info(
-                f"Serão geradas {len(st.session_state['dataset']['train']) * 5} imagens no total."
+                f"Serão geradas {len(st.session_state['dataset']['train']) * 5} variações de imagens durante o loop de treino."
             )
             st.session_state["use_augmentation"] = True
             st.success(
-                "Configurado. O aumento será aplicado durante o carregamento para treino."
+                "Configurado. O aumento (Rotação + Random Crop) será aplicado de forma transparente durante o treino."
             )
 
 elif page == "Treinar modelo":
     st.header("Treinar modelo")
 
-    if "train" not in st.session_state["dataset"]:
+    if "dataset" not in st.session_state or "train" not in st.session_state["dataset"]:
         st.warning("Carregue o dataset primeiro.")
         st.stop()
 
@@ -569,52 +611,49 @@ elif page == "Treinar modelo":
         lr = st.number_input("Taxa de aprendizado", value=1e-4, format="%.5f")
 
     if st.button("Iniciar treino"):
-        if "train" not in st.session_state["dataset"]:
-            st.error("Carregue o dataset primeiro.")
-        else:
-            log = st.empty()
-            progress_bar = st.progress(0)
-            graph = st.empty()
+        log = st.empty()
+        progress_bar = st.progress(0)
+        graph = st.empty()
 
-            ui_history = []
+        ui_history = []
 
-            def update(entry):
-                ui_history.append(entry)
+        def update(entry):
+            ui_history.append(entry)
 
-                log.text(
-                    "\n".join(
-                        f"Época {e['epoch']:3d} | "
-                        f"loss: {e['loss']:.4f} | "
-                        f"acc: {e['acuracy']:.2%} | "
-                        f"{e['time_s']}s"
-                        for e in ui_history[-10:]
-                    )
+            log.text(
+                "\n".join(
+                    f"Época {e['epoch']:3d} | "
+                    f"loss: {e['loss']:.4f} | "
+                    f"acc: {e['acuracy']:.2%} | "
+                    f"{e['time_s']}s"
+                    for e in ui_history[-10:]
                 )
-
-                progress_bar.progress(entry["epoch"] / epochs)
-
-                import pandas as pd
-
-                df = pd.DataFrame(ui_history)
-                graph.line_chart(df.set_index("epoch")[["loss", "acuracy"]])
-
-            model, history = train_model(
-                network_name=network_name,
-                classes_num=classes_num,
-                train_entries=st.session_state["dataset"]["train"],
-                epochs=int(epochs),
-                batch_size=int(batch_size),
-                lr=float(lr),
-                epoch_callback=update,
             )
 
-            key = f"{network_name}_nc{classes_num}"
-            path = f"{key}_weights.pth"
-            torch.save(model.state_dict(), path)
+            progress_bar.progress(entry["epoch"] / epochs)
 
-            st.session_state[f"model_{key}"] = model
-            st.session_state[f"path_{path}"] = path
-            st.success(f"Treino concluído. Pesos salvos em `{path}`")
+            import pandas as pd
+
+            df = pd.DataFrame(ui_history)
+            graph.line_chart(df.set_index("epoch")[["loss", "acuracy"]])
+
+        model, history = train_model(
+            network_name=network_name,
+            classes_num=classes_num,
+            train_entries=st.session_state["dataset"]["train"],
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            lr=float(lr),
+            epoch_callback=update,
+        )
+
+        key = f"{network_name}_nc{classes_num}"
+        path = f"{key}_weights.pth"
+        torch.save(model.state_dict(), path)
+
+        st.session_state[f"model_{key}"] = model
+        st.session_state[f"path_{path}"] = path
+        st.success(f"Treino concluído. Pesos salvos em `{path}`")
 
     st.divider()
     st.subheader("Carregar pesos salvos")
@@ -643,17 +682,15 @@ elif page == "Treinar modelo":
         st.session_state[f"path_{key}"] = weights_file.name
         st.success(f"Pesos carregados: {weights_file.name}")
 
-
 elif page == "Classificação binária":
     st.header("Classificação binária")
     st.caption("Benigno (BIRADS I+II) vs Maligno (BIRADS III+IV)")
 
-    if "test" not in st.session_state["dataset"]:
+    if "dataset" not in st.session_state or "test" not in st.session_state["dataset"]:
         st.warning("Carregue o dataset primeiro.")
         st.stop()
 
     col1, col2 = st.columns(2)
-
     with col1:
         network_name = st.selectbox("Rede", ["densenet", "inception"])
 
@@ -680,7 +717,7 @@ elif page == "Classificação binária":
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
-        st.metric("Tempoo", f"{time_span:.1f}s")
+        st.metric("Tempo", f"{time_span:.1f}s")
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Sensibilidade", f"{sensitivity:.2%}")
         col2.metric("Especificidade", f"{specificity:.2%}")
@@ -712,7 +749,7 @@ elif page == "Classificação 4 classes":
     st.header("Classificação 4 classes")
     st.caption("BIRADS I vs II vs III vs IV")
 
-    if "test" not in st.session_state["dataset"]:
+    if "dataset" not in st.session_state or "test" not in st.session_state["dataset"]:
         st.warning("Carregue o dataset primeiro.")
         st.stop()
 
@@ -750,7 +787,7 @@ elif page == "Classificação 4 classes":
         avg_sens = sum(sens_per_class) / len(sens_per_class)
         avg_spec = sum(spec_per_class) / len(spec_per_class)
 
-        st.metric("Tempoo", f"{time_span:.1f}s")
+        st.metric("Tempo", f"{time_span:.1f}s")
         col1, col2, col3 = st.columns(3)
         col1.metric("Sensibilidade média", f"{avg_sens:.2%}")
         col2.metric("Especificidade média", f"{avg_spec:.2%}")
@@ -816,22 +853,23 @@ elif page == "Grad-CAM":
         arr = np.array(Image.open(io.BytesIO(raw)).convert("L"))
 
         params = st.session_state.get(
-            "segmentation_params", {"threshold": 18, "kernel_size": 7}
+            "segmentation_params", {"clip_limit": 2.0, "kernel_size": 7}
         )
-        _, segmented_arr = segment_image(
-            arr, params["threshold"], params["kernel_size"]
+        
+        arr_clahe = apply_clahe(arr, clip_limit=params.get("clip_limit", 2.0))
+        _, cropped_segmented = segment_and_crop_image(
+            arr_clahe, params["kernel_size"]
         )
 
-        lo, hi = segmented_arr.min(), segmented_arr.max()
+        lo, hi = cropped_segmented.min(), cropped_segmented.max()
         if hi > lo:
-            arr_8 = ((segmented_arr.astype(np.float32) - lo) / (hi - lo) * 255).astype(
+            arr_8 = ((cropped_segmented.astype(np.float32) - lo) / (hi - lo) * 255).astype(
                 np.uint8
             )
         else:
-            arr_8 = np.zeros_like(segmented_arr, dtype=np.uint8)
+            arr_8 = np.zeros_like(cropped_segmented, dtype=np.uint8)
 
         resized_arr = cv2.resize(arr_8, (img_size, img_size))
-        arr_rgb = np.stack([resized_arr] * 3, axis=-1)
 
         tensor = torch.from_numpy(resized_arr).to(device)
         tensor = tensor.unsqueeze(0).repeat(3, 1, 1)
@@ -850,7 +888,7 @@ elif page == "Grad-CAM":
         heatmap, overlay = apply_gradcam(cam, resized_arr, img_size)
 
         col1, col2, col3 = st.columns(3)
-        col1.image(resized_arr, caption="Segmentada", clamp=True, width="content")
+        col1.image(resized_arr, caption="Segmentada e Cortada", clamp=True, width="content")
         col2.image(heatmap, caption="Mapa de calor", clamp=True, width="content")
         col3.image(overlay, caption="Sobreposição", clamp=True, width="content")
 
